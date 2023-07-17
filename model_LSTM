@@ -1,0 +1,508 @@
+# -*- coding:utf-8 -*-
+
+import os
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from torch.nn import functional as F
+from torch.nn.utils import clip_grad_norm_ as clip
+from torcheval.metrics.functional import binary_auprc
+import pickle
+import numpy as np
+import pandas as pd
+import scipy
+import scipy.io as scio
+from scipy import signal
+from scipy.signal import medfilt, filtfilt, butter
+import xlsxwriter as xlsw
+
+TRAIN = False  # 训练标志
+CONTINUE_TRAIN = False  # 接着上次某一次训练结果继续训练
+RestortModel = 'epoch_11.ckpt'
+TEST = True  # 测试标志 设置成True时候，需要指定加载哪个模型
+EPOCHS = 100
+BATCH_SIZE = 32
+Seqlength = 6000
+NUM_CLASS = 3
+
+data_path = './processing_data/'  # 数据预处理后的路径，便于调试网络
+test_data_path = './data/CHECK/'  # 测试数据保存的地址
+save_path = './model_save/'  # 保存模型的路径
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if device == 'cuda':
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = '1'
+
+if not os.path.exists(save_path):
+    os.mkdir(save_path)
+
+
+class ECGDataset(Dataset):
+
+    def __init__(self, data_path, data):
+        pkl = os.path.join(data_path, data)
+        with open(pkl, 'rb') as f:
+            signal, label = pickle.load(f)
+        self.signal = signal[:, 750:6750, :]
+        self.label = label
+
+    def __len__(self):
+        return len(self.signal)
+
+    def __getitem__(self, idx):
+        signals = torch.from_numpy(self.signal[idx]).float().to(device)
+        labels = torch.from_numpy(np.array(self.label[idx])).float().to(device)
+        sample = {'signal': signals, 'label': labels}
+        return sample
+
+
+# class TestDataset(Dataset):
+#
+#     def __init__(self, data_path, data):
+#         pkl = os.path.join(data_path, data)
+#         with open(pkl, 'rb') as fs:
+#             data = pickle.load(fs)
+#         for i in range(data.shape[0]):
+#             for j in range(data.shape[2]):
+#                 data[i, :, j] = scipy.signal.savgol_filter(data[i, :, j].reshape(data.shape[1]), 3, 1)
+#         #         b, a = signal.butter(8, [0.0008, 0.4], 'bandpass')
+#         #         data[i, :, j] = signal.filtfilt(b, a, data[i, :, j].reshape(data.shape[1]))
+#         self.signal = data[:, 750:6750, :]
+#
+#     def __len__(self):
+#         return len(self.signal)
+#
+#     def __getitem__(self, idx):
+#         signals = torch.from_numpy(np.array(self.signal[idx])).float().to(device)
+#         sample = {'signal': signals}
+#         return sample
+
+
+class SegModel(torch.nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, out_size, batch, seq_len):
+        super().__init__()
+        self.features = torch.nn.Sequential(
+            # torch.nn.Linear(in_features=input_size, out_features=hidden_size),
+            torch.nn.LSTM(input_size=input_size,
+                          hidden_size=hidden_size,
+                          num_layers=num_layers,
+                          batch_first=True,
+                          bidirectional=True),
+        )
+        self.classifier = torch.nn.Sequential(
+            torch.nn.LayerNorm([seq_len, 2 * hidden_size], eps=1e-6),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Dropout(),
+
+            torch.nn.Linear(2 * hidden_size, 2 * hidden_size),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Dropout(),
+
+            torch.nn.Linear(2 * hidden_size, hidden_size),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Dropout(),
+
+        )
+        self.output = torch.nn.Linear(hidden_size * seq_len, out_size)
+
+    def forward(self, x):
+        """
+        :param x: shape(batch, seq_len, input_size)
+        :return:
+        """
+        batch, seq_len, nums_fea = x.size()
+        features, _ = self.features(x)
+        output = self.classifier(features)
+        output = self.output(output.view(batch, -1))
+        return output
+
+
+def restore_net(data_path):
+    # load models
+    with open(data_path, 'rb') as fd:
+        net = torch.load(fd, map_location=torch.device('cpu'))
+    return net
+
+
+# focal_loss func, L = -α(1-yi)**γ *ce_loss(xi,yi)
+class FocalLoss(nn.Module):
+    def __init__(self, alpha, gamma=2, num_classes=3, size_average=True):
+        super(FocalLoss, self).__init__()
+        self.size_average = size_average
+        if isinstance(alpha, list):
+            assert len(alpha) == num_classes
+            self.alpha = torch.Tensor(alpha)
+        else:
+            assert alpha < 1
+            self.alpha = torch.zeros(num_classes)
+            self.alpha[0] += alpha
+            self.alpha[1:] += (1 - alpha)
+
+        self.gamma = gamma
+
+    def forward(self, preds, labels):
+        preds = preds.view(-1, preds.size(-1))
+        self.alpha = self.alpha.to(preds.device)
+        preds_softmax = F.softmax(preds, dim=1)
+        preds_logsoft = torch.log(preds_softmax)
+
+        alpha = self.alpha.expand(labels.size(0), -1)
+        # a = torch.mul(preds_softmax, labels)
+        # b = labels.sum(dim=1)
+        # c = torch.pow((1 - torch.mul(preds_softmax, labels).sum(dim=1)), self.gamma)
+        loss = -torch.mul(torch.pow((1 - torch.mul(preds_softmax, labels)), self.gamma)
+                          , torch.mul(preds_logsoft, labels))
+
+        loss = torch.mul(alpha, loss)
+        if self.size_average:
+            loss = loss.sum() / torch.count_nonzero(loss).item()
+        else:
+            loss = loss.sum()
+        return loss
+
+class AuprcLoss(nn.Module):
+    def __init__(self, size_average=True):
+        super(AuprcLoss, self).__init__()
+        self.size_average = size_average
+
+    def forward(self, preds, labels):
+        total = labels.size(0)
+        output_norm = preds / (preds.sum(dim=1).view(total, 1))
+        auprc_ori = 1 - binary_auprc(output_norm, labels, num_tasks=total)
+
+        if self.size_average:
+            loss = auprc_ori.mean()
+        else:
+            loss = auprc_ori.sum()
+        return loss
+
+def train(net, data_loader, epochs):
+    print("------------start train------------")
+    for step in range(epochs):
+        net.train().to(device)
+        for i, samples_batch in enumerate(data_loader):
+            if torch.any(samples_batch['signal'].isnan() == True):
+                continue
+
+            bias = 1e-20
+            output = net(samples_batch['signal']) + bias
+            target = samples_batch['label']
+            loss = criterion(output, target)
+            auprc_STE, auprc_STD, auprc_other = AUPRC_model(output, target)
+            if auprc_STE == 0 or auprc_STD == 0 or auprc_other == 0:
+                if auprc_STE == 0:
+                    auprc_STE = 'this batch don\'t have STE'
+                if auprc_STD == 0:
+                    auprc_STD = 'this batch don\'t have STD'
+                if auprc_other == 0:
+                    auprc_other = 'this batch don\'t have other'
+
+            # 每20个批次后输出一次数值
+            if (i + 1) % 20 == 0:
+                print("EPOCHS:{},Iter:{},Loss:{:.4f},AUPRC_STE:{},AUPRC_STD:{},AUPRC_other:{}"
+                      .format(step,
+                              i + 1,
+                              loss.item(),
+                              auprc_STE,
+                              auprc_STD,
+                              auprc_other))
+
+            # 反向传播过程
+            optimizer.zero_grad()
+            loss.backward()
+            # 梯度裁剪
+            clip(net.parameters(), max_norm=1)
+            optimizer.step()
+        # 每2个epoch,保存一次模型
+        if (step + 1) % 2 == 0:
+            torch.save(net, save_path + 'epoch_{}.ckpt'.format(step))
+        test(ecg_train_dl, 'train', step)
+        test(ecg_val_dl, 'val', step)
+
+
+def test(data_loader, str1, step):
+    with torch.no_grad():
+        total = 0.0  # 存储数据量
+        number = 0  # 存储批次数
+
+        # 不同标签的AUPRC
+        auprc_STE_all = 0.0
+        auprc_STD_all = 0.0
+        auprc_other_all = 0.0
+
+        # 存储无标签的批次数
+        STE = 0
+        STD = 0
+        OTHER = 0
+
+        net.eval()
+        for sample in data_loader:
+            if torch.any(sample['signal'].isnan() == True):
+                continue
+            output = net(sample['signal'])
+            label = sample['label']
+            total += label.size(0)
+            number += 1
+            auprc_STE, auprc_STD, auprc_other = AUPRC_model(output, label)
+            if auprc_STE == 0 or auprc_STD == 0 or auprc_other == 0:
+                if auprc_STE == 0:
+                    STE += 1
+                if auprc_STD == 0:
+                    STD += 1
+                if auprc_other == 0:
+                    OTHER += 1
+            auprc_STE_all += auprc_STE
+            auprc_STD_all += auprc_STD
+            auprc_other_all += auprc_other
+        if step != -1:
+            print("epoch:{},{}\tAUPRC_STE:{:.4f},AUPRC_STD:{:.4f},AUPRC_other:{:.4f}"
+                  .format(step, str1,
+                          auprc_STE_all / (number - STE),
+                          auprc_STD_all / (number - STD),
+                          auprc_other_all / (number - OTHER)))
+        else:
+            print("this test data's AUPRC_STE:{:.4f},AUPRC_STD:{:.4f},AUPRC_other:{:.4f}"
+                  .format(auprc_STE_all / (number - STE),
+                          auprc_STD_all / (number - STD),
+                          auprc_other_all / (number - OTHER)))
+
+
+def test_for_test(data):
+    with torch.no_grad():
+
+        net.eval()
+        predict = np.zeros((1, 3))
+        for i in range(data.size(0)):
+            if torch.any(data[i, :, :].isnan() == True):
+                continue
+            output = net(data[i, :, :].reshape(1, data.size(1), data.size(2)))
+            output_softmax = F.softmax(output, dim=1)
+            # output_norm = output / (output.sum(dim=1).view(output.size(0), 1))
+            predict = np.vstack((predict, output_softmax.cpu().numpy()))
+        predict = predict[1:]
+        print(predict)
+        workbook = xlsw.Workbook('submission.xlsx')
+        worksheet = workbook.add_worksheet()
+
+        row = 0
+        col = 0
+
+        worksheet.write(row, col + 1, 'name')
+        worksheet.write(row, col + 2, 'STE')
+        worksheet.write(row, col + 3, 'STD')
+        worksheet.write(row, col + 4, 'Others')
+
+        name = [str(x) + '.mat' for x in range(1000)]
+        for i in range(1000):
+            row += 1
+            worksheet.write(row, col, row - 1)
+            worksheet.write(row, col + 1, name[i])
+            worksheet.write(row, col + 2, predict[i, 0])
+            worksheet.write(row, col + 3, predict[i, 1])
+            worksheet.write(row, col + 4, predict[i, 2])
+        workbook.close()
+
+
+def AUPRC_model(output, target):
+    total = target.size(0)
+    output_norm = output / (output.sum(dim=1).view(total, 1))
+
+    # 初始化存储运算符
+    target_matrix_STE = np.array([0, 0, 0])
+    target_matrix_STD = np.array([0, 0, 0])
+    target_matrix_other = np.array([0, 0, 0])
+    # 将STE,STD,other不同情况进行分类
+    output_STE = torch.tensor([0, 0, 0]).to(device)
+    num_STE = 0
+    output_STD = torch.tensor([0, 0, 0]).to(device)
+    num_STD = 0
+    output_other = torch.tensor([0, 0, 0]).to(device)
+    num_other = 0
+
+    # 对齐维度，并对不同的类别进行AUPRC分类
+    idx: int
+    for idx in range(total):
+        if torch.all(target[idx,] == torch.tensor([0, 0, 1]).to(device)):
+            target_matrix_other = np.vstack((target_matrix_other, np.array([0, 0, 1])))
+            output_other = torch.vstack((output_other, output_norm[idx]))
+            num_other += 1
+        elif torch.all(target[idx,] == torch.tensor([1, 0, 0]).to(device)):
+            target_matrix_STE = np.vstack((target_matrix_STE, np.array([1, 0, 0])))
+            output_STE = torch.vstack((output_STE, output_norm[idx]))
+            num_STE += 1
+        elif torch.all(target[idx,] == torch.tensor([0, 1, 0]).to(device)):
+            target_matrix_STD = np.vstack((target_matrix_STD, np.array([0, 1, 0])))
+            output_STD = torch.vstack((output_STD, output_norm[idx]))
+            num_STD += 1
+        elif torch.all(target[idx,] == torch.tensor([1, 1, 0]).to(device)):
+            target_matrix_STE = np.vstack((target_matrix_STE, np.array([1, 1, 0])))
+            output_STE = torch.vstack((output_STE, output_norm[idx]))
+            target_matrix_STD = np.vstack((target_matrix_STD, np.array([1, 1, 0])))
+            output_STD = torch.vstack((output_STD, output_norm[idx]))
+            num_STD += 1
+            num_STE += 1
+
+    # 去掉多余初始化值
+    target_matrix_STE = torch.tensor(target_matrix_STE[1:]).to(device)
+    target_matrix_STD = torch.tensor(target_matrix_STD[1:]).to(device)
+    target_matrix_other = torch.tensor(target_matrix_other[1:]).to(device)
+    output_STE = output_STE[1:]
+    output_STD = output_STD[1:]
+    output_other = output_other[1:]
+
+    # 计算不同标签的AUPRC
+    if num_STE != 0:
+        auprc_STE_ori = binary_auprc(output_STE, target_matrix_STE, num_tasks=num_STE)
+        auprc_STE = (auprc_STE_ori.sum()) / num_STE
+    else:
+        auprc_STE = torch.tensor(0)
+    if num_STD != 0:
+        auprc_STD_ori = binary_auprc(output_STD, target_matrix_STD, num_tasks=num_STD)
+        auprc_STD = (auprc_STD_ori.sum()) / num_STD
+    else:
+        auprc_STD = torch.tensor(0)
+    if num_other != 0:
+        auprc_other_ori = binary_auprc(output_other, target_matrix_other, num_tasks=num_other)
+        auprc_other = (auprc_other_ori.sum()) / num_other
+    else:
+        auprc_other = torch.tensor(0)
+
+    return auprc_STE.item(), auprc_STD.item(), auprc_other.item()
+
+
+def baseline_correction(signals):
+
+    base_line = medfilt(signals, 99)
+    base_line = medfilt(base_line, 299)
+    signals = signals - base_line
+    return signals
+
+
+def ecg_preprocess(record, c):
+
+    for i in range(c):
+        record[:, i] = baseline_correction(record[:, i])
+    return record
+
+
+if __name__ == '__main__':
+
+    print(device)
+    # print(torch.cuda.is_available())
+    # print(torch.cuda.get_device_name(0))
+    # print(torch.version.cuda)
+    # print(torch.backends.cudnn.version())
+    # torch.multiprocessing.set_start_method('spawn')
+
+    if TRAIN:
+        # loading data
+        ecg_train_db = ECGDataset(data_path, 'train_data.pkl')
+        ecg_train_dl = DataLoader(ecg_train_db, batch_size=BATCH_SIZE,
+                                  shuffle=True, num_workers=0)
+
+        ecg_val_db = ECGDataset(data_path, 'val_data.pkl')
+        ecg_val_dl = DataLoader(ecg_val_db, batch_size=BATCH_SIZE,
+                                shuffle=False, num_workers=0)
+
+        if CONTINUE_TRAIN:
+            # continue training
+            net = restore_net(save_path + RestortModel)
+        else:
+            # model
+            net = SegModel(input_size=12, hidden_size=BATCH_SIZE, num_layers=3, out_size=NUM_CLASS,
+                           batch=BATCH_SIZE, seq_len=Seqlength).to(device)
+
+        optimizer = torch.optim.Adam(net.parameters(), lr=1e-5, eps=1e-4)
+        criterion = FocalLoss(alpha=[2, 2, 1], num_classes=3, gamma=2, size_average=True)
+        optimizer.zero_grad()
+
+        train(net, ecg_train_dl, EPOCHS)
+
+    if TEST:
+        print("------------start test------------")
+        # 获得文件名称
+        dataname = os.listdir(test_data_path)
+        filesname = [test_data_path + x for x in dataname if x[-4:] == '.mat']
+        # 提取数据值
+        files = np.zeros((1, 7500, 12))
+        for i, file in enumerate(filesname):
+            data = scio.loadmat(file)
+            data = data['ecg'][:12, ].T.reshape(1, 7500, 12)
+            files = np.vstack((files, data))
+
+        # 去掉数据值的初始化实例
+        files = files[1:]
+
+        for i in range(files.shape[0]):
+            for j in range(files.shape[2]):
+                b, a = butter(5, [0.0008, 0.4], 'bandpass')
+                files[i, :, j] = filtfilt(b, a, files[i, :, j].reshape(files.shape[1]))
+                files[i, :, j] = scipy.signal.savgol_filter(files[i, :, j].reshape(files.shape[1]), 5, 2)
+        # 中值滤波
+        medfilt_data = np.zeros((1, 7500, 12))
+        for i in range(files.shape[0]):
+            signal_data = ecg_preprocess(files[i, :, :], files.shape[2]).reshape(1, 7500, 12)
+            medfilt_data = np.vstack((medfilt_data, signal_data))
+        medfilt_data = medfilt_data[1:]
+
+        files = medfilt_data
+        files = files[:, 750:6750, :]
+
+        signals = torch.from_numpy(files).float().to(device)
+        print("------------test data loaded------------")
+
+        # 仅调试用
+        # ecg_test_db = ECGDataset(data_path, 'train_data.pkl')
+        # ecg_test_dl = DataLoader(ecg_test_db, batch_size=BATCH_SIZE,
+        #                          shuffle=False, num_workers=1)
+        # dataname = os.listdir('./data/Test/')
+        # filesname = ['./data/Test/' + x for x in dataname if x[-4:] == '.mat']
+        # # 提取数据值
+        # files = np.zeros((1, 7500, 12))
+        # labels = np.zeros((1, 1, 3))
+        # for i, file in enumerate(filesname):
+        #     matdata = scio.loadmat(file)
+        #     data = matdata['ecg'][:12, ].T.reshape(1, 7500, 12)
+        #     label = np.array(matdata['label'][0, :].reshape(1,3)).reshape(1, 1, 3)
+        #     files = np.vstack((files, data))
+        #     labels = np.vstack((labels, label))
+        #
+        # # 去掉数据值的初始化实例
+        # files = files[1:]
+        # labels = labels[1:]
+        #
+        # for i in range(files.shape[0]):
+        #     for j in range(files.shape[2]):
+        #         b, a = butter(5, [0.0008, 0.4], 'bandpass')
+        #         files[i, :, j] = filtfilt(b, a, files[i, :, j]
+        #                                      .reshape(files.shape[1]))
+        #         files[i, :, j] = scipy.signal.savgol_filter(files[i, :, j].reshape(files.shape[1]), 5, 2)
+        # # 中值滤波
+        # medfilt_data = np.zeros((1, 7500, 12))
+        # for i in range(files.shape[0]):
+        #     signal_data = ecg_preprocess(files[i, :, :], files.shape[2]).reshape(1, 7500, 12)
+        #     medfilt_data = np.vstack((medfilt_data, signal_data))
+        # medfilt_data = medfilt_data[1:]
+        # medfilt_data = medfilt_data[:, 750:6750, :]
+        # with open('./data/Test/' + 'test_data.pkl', 'wb') as f1:
+        #     pickle.dump((files, labels), f1)
+        # ecg_test_db = ECGDataset('./data/Test/', 'test_data.pkl')
+        # ecg_test_dl = DataLoader(ecg_test_db, batch_size=BATCH_SIZE,
+        #                           shuffle=True, num_workers=1)
+
+        # 载入保存的训练网络模型
+        net = restore_net(save_path + 'model.ckpt')
+        net.eval()
+        print("------------net data loaded------------")
+        # 测试数据
+        test_for_test(signals)
+
+        # # 仅调试用
+        # modelname = os.listdir(save_path)
+        # modelnames = [save_path + x for x in modelname if x[-5:] == '.ckpt']
+        # for i in modelnames[-5:]:
+        #     net = restore_net(i)
+        #     net.eval()
+        #     print(i)
+        #     # test_for_test(signals)
+        #     test(ecg_test_dl, 'test', -1)
